@@ -1,0 +1,19 @@
+# 仓库采用白名单：默认忽略项目目录中的所有内容
+*
+
+# Git 配置文件
+!.gitignore
+
+# 源代码、构建配置和测试
+!*.py
+!*.spec
+!requirements-build.txt
+!build_release.ps1
+!tests/
+!tests/*.py
+
+# 唯一允许提交的 Excel 模板
+!报销清单表.xlsx
+
+# 使用说明
+!使用说明.txt
