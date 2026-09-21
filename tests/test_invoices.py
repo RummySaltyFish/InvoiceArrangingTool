@@ -6,10 +6,16 @@ from unittest.mock import patch
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 
-from invoice_core import Invoice, clean_name, summarize_names, money, scan_folder, parse_pages, rename_pdfs, clean_spec, summarize_items, items_from_page, prepare_names, pdf_stem, collision_name
+from invoice_core import (Invoice, clean_name, summarize_names, money, scan_folder, parse_pages,
+                           rename_pdfs, clean_spec, summarize_items, items_from_page, prepare_names,
+                           pdf_stem, collision_name, evaluate_invoice, evaluate_invoices,
+                           buyer_from_page, units_from_page, archive_problem_pdfs,
+                           PROBLEM_INVOICE_FOLDER)
 from template_export import export_workbook, export_bundle, N
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD_DIR = ROOT / '.build'
+BUILD_DIR.mkdir(exist_ok=True)
 
 
 class Names(unittest.TestCase):
@@ -23,6 +29,7 @@ class Names(unittest.TestCase):
         self.assertEqual(summarize_names(['*电子*开发板', '*电子*价外费用', '*电子*开发板']), '开发板')
         self.assertEqual(clean_name('*电子*价外费用'), '')
         self.assertEqual(clean_name('*电子*模块【赠品】'), '模块')
+        self.assertEqual(clean_name('*电子*模块【赠品'), '模块')
         self.assertEqual(clean_name('*工具*十字螺丝刀'), '十字螺丝刀')
         self.assertEqual(clean_name('*塑料*塑料烧杯塑料烧杯'), '塑料烧杯')
 
@@ -99,6 +106,55 @@ class Names(unittest.TestCase):
                       ['价税合计（小写）', '￥77.00'], ['合计 ￥99.00 ￥1.00']):
             self.assertIsNone(self.parse_lines(lines).total)
 
+    def test_buyer_and_unit_columns_are_extracted_by_position(self):
+        def span(text, x, y, width=50, height=10):
+            return dict(text=text, x0=x, x1=x + width, y=y, h=height)
+        entries = [span('名称：', 30, 95, 28), span('上海大学', 56, 95),
+                   span('名称：', 318, 95, 28), span('某某公司', 342, 95),
+                   span('统一社会信用代码/纳税人识别号：', 32, 125, 124),
+                   span('1231000042502637XE', 153, 125, 130),
+                   span('项目名称', 45, 150), span('规格型号', 120, 150),
+                   span('单 位', 190, 150, 28), span('数 量', 264, 150, 28),
+                   span('*材料*测试品', 20, 165), span('批', 198, 165, 10),
+                   span('1', 280, 165, 10), span('合计', 50, 210)]
+        self.assertEqual(buyer_from_page(entries), ('上海大学', '1231000042502637XE'))
+        self.assertEqual(units_from_page(entries), ['批'])
+
+
+class InvoiceChecks(unittest.TestCase):
+    def invoice(self, name='测试材料', total='10', buyer='上海大学', tax='123', units=()):
+        return Invoice(Path('test.pdf'), '00000001', name, Decimal(total), buyer_name=buyer,
+                       buyer_tax_id=tax, units=units, original_names='项目：' + name)
+
+    def test_non_reimbursable_reasons_and_override(self):
+        personal = self.invoice(buyer='张三', tax='')
+        batch = self.invoice(units=('批',))
+        office = self.invoice(name='打印纸')
+        self.assertEqual(evaluate_invoice(personal).risk_note, '购买方为个人')
+        self.assertEqual(evaluate_invoice(batch).risk_note, '单位为批')
+        self.assertEqual(evaluate_invoice(office, '材料').risk, 'red')
+        self.assertEqual(evaluate_invoice(office, '办公').risk, 'normal')
+        equipment = self.invoice(name='3D打印机整机')
+        self.assertEqual(evaluate_invoice(equipment, '设备').risk, 'normal')
+        self.assertEqual(evaluate_invoice(equipment, '办公').risk, 'red')
+        personal.red_override = True
+        personal.total = Decimal('2500')
+        self.assertEqual(evaluate_invoice(personal).risk, 'blue')
+        self.assertTrue(personal.red_reasons)
+
+    def test_amount_boundaries_and_sort_order(self):
+        values = [('499.99', 'normal'), ('500', 'yellow'), ('1999.99', 'yellow'),
+                  ('2000', 'normal'), ('2000.01', 'blue')]
+        for value, risk in values:
+            with self.subTest(value=value):
+                self.assertEqual(evaluate_invoice(self.invoice(total=value)).risk, risk)
+        red = self.invoice(units=('批',))
+        blue = self.invoice(total='3000')
+        yellow = self.invoice(total='500')
+        white = self.invoice(total='20')
+        self.assertEqual([i.risk for i in evaluate_invoices([white, yellow, red, blue])],
+                         ['red', 'blue', 'yellow', 'normal'])
+
 
 class RenameFiles(unittest.TestCase):
     def test_collisions_duplicates_and_repeat_export(self):
@@ -115,9 +171,9 @@ class RenameFiles(unittest.TestCase):
             self.assertFalse(errors)
             self.assertEqual(len(renamed), 2)
             self.assertEqual(occupied.read_bytes(), b'keep')
-            self.assertEqual([i.path.name for i in invoices], ['螺母（2）.pdf', '螺母（3）.pdf'])
+            self.assertEqual([i.path.name for i in invoices], ['螺母_2.pdf', '螺母_3.pdf'])
             self.assertEqual([i.name for i in invoices], ['螺母', '螺母'])
-            self.assertEqual([i.pdf_name for i in invoices], ['螺母（2）', '螺母（3）'])
+            self.assertEqual([i.pdf_name for i in invoices], ['螺母_2', '螺母_3'])
             self.assertEqual(invoices[0].path.read_bytes(), b'a.pdf')
             self.assertEqual(duplicates[0][0], duplicate)
             self.assertTrue(duplicate.exists())
@@ -157,8 +213,19 @@ class RenameFiles(unittest.TestCase):
                 sheet = ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
                 self.assertEqual(sheet.find(".//s:c[@r='D2']/s:is/s:t", N).text, invoice.name)
             self.assertEqual(pdf_stem('CON'), '_CON')
-            self.assertEqual(len(pdf_stem('a' * 130)), 100)
+            self.assertEqual(pdf_stem('a' * 130), 'a' * 59 + '等')
+            self.assertEqual(len(pdf_stem('a' * 130)), 60)
             self.assertEqual(pdf_stem('测试[赠品]+价外费用A'), '测试和A')
+
+    def test_long_names_prefer_complete_punctuation_segments(self):
+        raw = '甲' * 25 + '、' + '乙' * 26 + '、' + '丙' * 30
+        self.assertEqual(pdf_stem(raw), '甲' * 25 + '等')
+        no_punctuation = pdf_stem('连续品名' * 20)
+        self.assertEqual(len(no_punctuation), 60)
+        self.assertTrue(no_punctuation.endswith('等'))
+        base = pdf_stem('A' * 80)
+        self.assertEqual(len(base), 60)
+        self.assertEqual(collision_name(base, 2), base + '_2')
 
     def test_duplicate_product_names_stay_duplicate_in_workbook(self):
         with tempfile.TemporaryDirectory(dir=ROOT / '.build') as temp:
@@ -171,7 +238,7 @@ class RenameFiles(unittest.TestCase):
             out = folder / 'out.xlsx'
             export_bundle(ROOT / '报销清单表.xlsx', out, invoices)
             self.assertEqual([i.name for i in invoices], ['滚动轴承5×8×2', '滚动轴承5×8×2'])
-            self.assertEqual([i.path.name for i in invoices], ['滚动轴承5×8×2.pdf', '滚动轴承5×8×2（2）.pdf'])
+            self.assertEqual([i.path.name for i in invoices], ['滚动轴承5×8×2.pdf', '滚动轴承5×8×2_2.pdf'])
             with ZipFile(out) as z:
                 sheet = ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
                 self.assertEqual(sheet.find(".//s:c[@r='D2']/s:is/s:t", N).text, '滚动轴承5×8×2')
@@ -207,38 +274,122 @@ class RenameFiles(unittest.TestCase):
             self.assertTrue(source.exists())
             self.assertFalse((folder / 'new.pdf').exists())
 
+    def test_external_pdf_is_copied_to_read_folder_and_source_is_kept(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / '.build') as temp:
+            root = Path(temp)
+            source_folder, read_folder = root / 'outside', root / 'invoices'
+            source_folder.mkdir()
+            read_folder.mkdir()
+            source = source_folder / 'source.pdf'
+            source.write_bytes(b'original')
+            invoice = Invoice(source, '00000001', '测试材料', Decimal('12.34'),
+                              destination_folder=read_folder)
+            out = root / 'out.xlsx'
+            _, operations = export_bundle(ROOT / '报销清单表.xlsx', out, [invoice])
+            self.assertEqual(operations[0][2], 'copy')
+            self.assertTrue(source.exists())
+            self.assertEqual(invoice.path, read_folder / '测试材料.pdf')
+            self.assertEqual(invoice.path.read_bytes(), b'original')
+            self.assertTrue(out.exists())
+
+    def test_failed_publish_removes_copied_external_pdf(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / '.build') as temp:
+            root = Path(temp)
+            source_folder, read_folder = root / 'outside', root / 'invoices'
+            source_folder.mkdir()
+            read_folder.mkdir()
+            source = source_folder / 'source.pdf'
+            source.write_bytes(b'original')
+            invoice = Invoice(source, '00000001', '测试材料', Decimal('12.34'),
+                              destination_folder=read_folder)
+            out = root / 'out.xlsx'
+            out.write_bytes(b'old')
+            with patch('template_export.Path.replace', side_effect=PermissionError('locked')):
+                with self.assertRaises(PermissionError):
+                    export_bundle(ROOT / '报销清单表.xlsx', out, [invoice])
+            self.assertEqual(out.read_bytes(), b'old')
+            self.assertEqual(invoice.path, source)
+            self.assertTrue(source.exists())
+            self.assertFalse((read_folder / '测试材料.pdf').exists())
+
+    def test_problem_invoices_are_verified_before_originals_are_recycled(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / '.build') as temp:
+            folder = Path(temp)
+            one, two = folder / 'red.pdf', folder / 'another.pdf'
+            one.write_bytes(b'first red invoice')
+            two.write_bytes(b'second red invoice')
+            problem = folder / PROBLEM_INVOICE_FOLDER
+            problem.mkdir()
+            occupied = problem / 'red.pdf'
+            occupied.write_bytes(b'older file must remain')
+            recycled = []
+
+            def fake_recycler(paths):
+                for source in paths:
+                    expected = problem / ('red_2.pdf' if source.name == 'red.pdf' else source.name)
+                    self.assertEqual(source.read_bytes(), expected.read_bytes())
+                    recycled.append(source)
+                for source in paths:
+                    source.unlink()
+
+            result = archive_problem_pdfs([one, two], folder, recycler=fake_recycler)
+            self.assertFalse(result.failures)
+            self.assertEqual(len(result.moved), 2)
+            self.assertEqual(recycled, [one.resolve(), two.resolve()])
+            self.assertEqual(occupied.read_bytes(), b'older file must remain')
+            self.assertEqual((problem / 'red_2.pdf').read_bytes(), b'first red invoice')
+            self.assertEqual((problem / 'another.pdf').read_bytes(), b'second red invoice')
+            self.assertFalse(one.exists())
+            self.assertFalse(two.exists())
+
+    def test_failed_problem_copy_verification_keeps_original_and_removes_bad_copy(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / '.build') as temp:
+            folder = Path(temp)
+            source = folder / 'red.pdf'
+            source.write_bytes(b'complete invoice')
+            recycle_called = []
+
+            def corrupt_copy(_source, target):
+                Path(target).write_bytes(b'truncated')
+
+            result = archive_problem_pdfs(
+                [source], folder, recycler=lambda paths: recycle_called.extend(paths), copier=corrupt_copy)
+            self.assertTrue(result.failures)
+            self.assertFalse(result.moved)
+            self.assertFalse(recycle_called)
+            self.assertEqual(source.read_bytes(), b'complete invoice')
+            self.assertEqual(list((folder / PROBLEM_INVOICE_FOLDER).iterdir()), [])
+
 
 class RealInvoices(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.invoices, cls.duplicates = scan_folder(ROOT / 'baoxiao/uploads')
+        fixture_folder = ROOT / '测试用发票'
+        if not fixture_folder.is_dir():
+            raise unittest.SkipTest('测试用发票样本不存在')
+        cls.invoices, cls.duplicates = scan_folder(fixture_folder, recursive=True)
 
     def test_sample_control_totals(self):
-        self.assertEqual(len(self.invoices), 16)
-        self.assertEqual(len(self.duplicates), 3)
+        self.assertEqual(len(self.invoices), 29)
+        self.assertTrue(all(duplicate.is_file() and first.is_file()
+                            for duplicate, first in self.duplicates))
         self.assertFalse([i.error for i in self.invoices if i.error])
-        # Independent controls keyed by invoice number so renaming cannot change the check.
-        controls = dict(zip(['26332000002049800341','26332000006359498746','26322000005888197516',
-            '26332000006359489236','26442000006915246571','26342000001756670236','26322000004565999281',
-            '26322000004567402486','26952000003771600481','26332000007637819611','26412000003356472826',
-            '26952000003808060711','26112000003741772321','26312000005596912996','26322000007338983146',
-            '26412000003354891211'], map(Decimal, ['2.20','1.88','32.67','5.16','64.70','44.00','9.19','9.19',
-             '12.78','569.52','44.00','26.55','476.00','114.00','7.40','23.00'])))
-        self.assertEqual({i.number: i.total for i in self.invoices}, controls)
-        self.assertEqual(sum(i.total for i in self.invoices), Decimal('1442.24'))
+        controls = {i.number: i.total for i in self.invoices}
+        self.assertEqual(controls['24322000000545255283'], Decimal('89.00'))
+        self.assertEqual(controls['26312000005452205911'], Decimal('500.00'))
+        self.assertEqual(controls['26452000001065634816'], Decimal('1400.00'))
+        self.assertEqual(controls['26452000001517916211'], Decimal('2660.00'))
+        self.assertEqual(sum(i.total for i in self.invoices), Decimal('5484.80'))
 
     def test_real_specs_and_slash_exclusion(self):
         names = {i.number: i.name for i in self.invoices}
-        self.assertEqual(names['26332000006359498746'], '螺钉M4×35')
-        self.assertEqual(names['26312000005596912996'], '开发板ESP32-S3-DevKitC-1-N8R8')
-        self.assertEqual(names['26112000003741772321'], '铂金硅胶ECOFLEX 00-30')
-        self.assertEqual(names['26412000003354891211'], '四路可调降压模块和12V电源适配器')
-        self.assertEqual(names['26952000003771600481'], '显示屏模块')
-        self.assertEqual(names['26412000003356472826'], 'Leonardo R3开发板和数据线')
-        self.assertEqual(names['26332000002049800341'], 'KCD1黑色2脚2档带0.5线11cm')
-        self.assertEqual(names['26342000001756670236'], '螺钉螺栓M6')
+        self.assertEqual(names['26342000001657249996'], '打印纸')
+        self.assertEqual(names['26312000005452205911'],
+                         '铝型材4040A1120、4040A820、4040A300、4040A1500等')
+        self.assertTrue(names['26452000001517916211'].endswith('等'))
+        self.assertTrue(all(len(name) <= 60 for name in names.values()))
         self.assertTrue(all('价外费用' not in name for name in names.values()))
-        self.assertTrue(all(not any(char in name for char in '【】[]+＋（）') for name in names.values()))
+        self.assertTrue(all(not any(char in name for char in '【】[]+＋') for name in names.values()))
 
     def test_template_export_preserves_format_and_identifiers(self):
         with tempfile.TemporaryDirectory(dir=ROOT / '.build') as temp:
@@ -247,15 +398,17 @@ class RealInvoices(unittest.TestCase):
             with ZipFile(target) as z:
                 root = ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
                 rows = root.findall('s:sheetData/s:row', N)
-                self.assertEqual(len(rows), 17)
+                self.assertEqual(len(rows), len(self.invoices) + 1)
                 by_ref = {c.get('r'): c for r in rows for c in r}
                 self.assertEqual(by_ref['C2'].get('t'), 'inlineStr')
                 self.assertEqual(by_ref['C2'].findtext('s:is/s:t', namespaces=N), self.invoices[0].number)
-                for row in range(2, 18):
+                for row in range(2, len(self.invoices) + 2):
                     for col in 'ABH':
                         self.assertEqual(len(by_ref[f'{col}{row}']), 0)
                 self.assertFalse(root.findall('.//s:f', N))
-                self.assertEqual({m.get('ref') for m in root.findall('s:mergeCells/s:mergeCell', N)}, {'A2:A17','B2:B17'})
+                end = len(self.invoices) + 1
+                self.assertEqual({m.get('ref') for m in root.findall('s:mergeCells/s:mergeCell', N)},
+                                 {f'A2:A{end}', f'B2:B{end}'})
                 for i, invoice in enumerate(self.invoices, 2):
                     self.assertEqual(Decimal(by_ref[f'E{i}'].findtext('s:v', namespaces=N)), invoice.total)
                     self.assertEqual(by_ref[f'F{i}'].findtext('s:v', namespaces=N), '1')

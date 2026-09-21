@@ -1,13 +1,19 @@
 """Offline PDF invoice extraction and name normalization."""
 from __future__ import annotations
 
+import hashlib
 import re
+import shutil
+import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
-MAX_FILENAME_STEM_LENGTH = 100
+MAX_PRODUCT_NAME_LENGTH = 60
+SOFT_SEGMENT_LIMIT = 50
+NAME_PUNCTUATION = "、，,；;。！!？?：:／/｜|"
+PROBLEM_INVOICE_FOLDER = "存在问题的发票"
 
 
 @dataclass
@@ -21,10 +27,30 @@ class Invoice:
     engine: str = "文本"
     original_names: str = ""
     pdf_name: str = ""
+    destination_folder: Path | None = None
+    buyer_name: str = ""
+    buyer_tax_id: str = ""
+    units: tuple[str, ...] = ()
+    red_reasons: tuple[str, ...] = ()
+    red_override: bool = False
+    risk: str = "normal"
+    risk_note: str = ""
 
     @property
     def key(self):
         return self.code, self.number
+
+
+@dataclass(frozen=True)
+class ProblemArchiveResult:
+    folder: Path
+    moved: tuple[tuple[Path, Path], ...] = ()
+    already_present: tuple[Path, ...] = ()
+    failures: tuple[tuple[Path, str], ...] = ()
+
+    @property
+    def archived_sources(self):
+        return tuple(source for source, _ in self.moved) + self.already_present
 
 
 def compact(text):
@@ -43,7 +69,7 @@ def money(text):
 
 def remove_square_notes(value):
     """Remove square-bracket notes, including their contents."""
-    return re.sub(r"【[^】]*】|\[[^\]]*\]", "", value)
+    return re.sub(r"【[^】]*(?:】|$)|\[[^\]]*(?:\]|$)", "", value)
 
 
 def normalize_name(value):
@@ -197,6 +223,124 @@ def items_from_page(entries):
     return items
 
 
+def _same_row(left, right):
+    return abs(left["y"] - right["y"]) < max(left["h"], right["h"]) * .7
+
+
+def buyer_from_page(entries):
+    """Extract the buyer name and tax ID from the left half of an invoice."""
+    if not entries:
+        return "", ""
+    page_right = max(e["x1"] for e in entries)
+    name_labels = sorted((e for e in entries
+                          if compact(e["text"]).replace("：", ":").startswith("名称:")),
+                         key=lambda e: e["x0"])
+    buyer_label = next((e for e in name_labels if e["x0"] < page_right * .5), None)
+    if buyer_label is None:
+        return "", ""
+    seller_x = min(next((e["x0"] for e in name_labels if e["x0"] > buyer_label["x0"]), page_right * .5),
+                   page_right * .5)
+    label_text = buyer_label["text"].replace("：", ":")
+    inline_name = label_text.split(":", 1)[1].strip() if ":" in label_text else ""
+    name_parts = [e["text"].strip() for e in entries
+                  if e is not buyer_label and _same_row(e, buyer_label)
+                  and e["x0"] >= buyer_label["x1"] - buyer_label["h"] * 1.2 and e["x0"] < seller_x]
+    buyer_name = compact(inline_name + "".join(name_parts))
+
+    tax_labels = sorted((e for e in entries if "统一社会信用代码/纳税人识别号" in compact(e["text"])),
+                        key=lambda e: e["x0"])
+    tax_label = next((e for e in tax_labels if e["x0"] < page_right * .5), None)
+    buyer_tax_id = ""
+    if tax_label:
+        tax_parts = [e["text"].strip() for e in entries
+                     if e is not tax_label and _same_row(e, tax_label)
+                     and e["x0"] >= tax_label["x1"] - tax_label["h"] * 1.2 and e["x0"] < seller_x]
+        buyer_tax_id = compact("".join(tax_parts))
+    return buyer_name, buyer_tax_id
+
+
+def units_from_page(entries):
+    """Return item units from the unit column, excluding headings and totals."""
+    rows = group_rows(entries)
+    unit_header = next((e for e in entries if compact(e["text"]) == "单位"), None)
+    if unit_header is None:
+        return []
+    quantity_header = next((e for e in entries if compact(e["text"]) == "数量"
+                            and abs(e["y"] - unit_header["y"]) < unit_header["h"] * 2), None)
+    right = quantity_header["x0"] - unit_header["h"] * .5 if quantity_header else unit_header["x1"] + unit_header["h"] * 5
+    end = min((r["y"] for r in rows if r["y"] > unit_header["y"] and
+               ("合计" in compact(r["text"]) or compact(r["text"]).startswith("备注"))), default=float("inf"))
+    units = []
+    for row in rows:
+        if not (unit_header["y"] + unit_header["h"] * .5 < row["y"] < end):
+            continue
+        value = compact("".join(e["text"] for e in row["entries"]
+                                if e["x0"] >= unit_header["x0"] - unit_header["h"] and e["x0"] < right))
+        if value and re.fullmatch(r"[\u4e00-\u9fffA-Za-z]{1,8}", value) and value not in units:
+            units.append(value)
+    return units
+
+
+OFFICE_PATTERN = re.compile(
+    r"打印纸|复印纸|纸张|中性笔|签字笔|圆珠笔|铅笔|钢笔|马克笔|记号笔|荧光笔|笔芯|"
+    r"笔记本(?!电脑)|图书|书籍|教材|墨盒|碳粉|硒鼓"
+)
+EQUIPMENT_PATTERN = re.compile(
+    r"电脑整机|计算机整机|笔记本电脑|台式电脑|台式机|电脑主机|计算机主机|工作站|服务器|"
+    r"3D打印机|三维打印机|打印机整机|复印机|扫描仪|投影仪|数控机床|整机", re.I
+)
+
+
+def goods_type(invoice):
+    text = compact(invoice.name + "\n" + invoice.original_names)
+    # Printer consumables are office supplies even though their names contain 打印机.
+    if OFFICE_PATTERN.search(text):
+        return "办公"
+    if EQUIPMENT_PATTERN.search(text) or text in {"电脑", "计算机", "打印机", "机器", "设备"}:
+        return "设备"
+    return "材料"
+
+
+def buyer_is_person(invoice):
+    if "个人" in invoice.buyer_name:
+        return True
+    if invoice.buyer_tax_id:
+        return False
+    organization_words = "公司|大学|学院|学校|中心|研究院|医院|政府|委员会|协会|合作社|事务所|集团|厂|店"
+    return bool(re.fullmatch(r"[\u4e00-\u9fff]{2,4}", invoice.buyer_name)
+                and not re.search(organization_words, invoice.buyer_name))
+
+
+def evaluate_invoice(invoice, expense_type="材料"):
+    if expense_type not in {"材料", "办公", "设备"}:
+        raise ValueError("报销类型必须是材料、办公或设备")
+    reasons = []
+    if buyer_is_person(invoice):
+        reasons.append("购买方为个人")
+    if "批" in invoice.units:
+        reasons.append("单位为批")
+    actual_type = goods_type(invoice)
+    if actual_type != expense_type:
+        reasons.append(f"品名属于{actual_type}，与{expense_type}类型不符")
+    invoice.red_reasons = tuple(reasons)
+    if reasons and not invoice.red_override:
+        invoice.risk, invoice.risk_note = "red", "；".join(reasons)
+    elif invoice.total is not None and invoice.total > Decimal("2000"):
+        invoice.risk, invoice.risk_note = "blue", "需要公对公转账"
+    elif invoice.total is not None and Decimal("500") <= invoice.total < Decimal("2000"):
+        invoice.risk, invoice.risk_note = "yellow", "需要支付凭证"
+    else:
+        invoice.risk, invoice.risk_note = "normal", ""
+    return invoice
+
+
+def evaluate_invoices(invoices, expense_type="材料"):
+    for invoice in invoices:
+        evaluate_invoice(invoice, expense_type)
+    order = {"red": 0, "blue": 1, "yellow": 2, "normal": 4}
+    return sorted(invoices, key=lambda invoice: order[invoice.risk] if not invoice.error else 3)
+
+
 def parse_pages(path, pages, engine="文本"):
     text = "\n".join(r["text"] for page in pages for r in group_rows(page))
     flat = compact(text).replace("（", "(").replace("）", ")").replace("．", ".").replace("−", "-")
@@ -222,6 +366,10 @@ def parse_pages(path, pages, engine="文本"):
     if len(totals) == 1:
         invoice.total = totals[0]
     items = [item for page in pages for item in items_from_page(page)]
+    buyers = [buyer_from_page(page) for page in pages]
+    invoice.buyer_name = next((name for name, _ in buyers if name), "")
+    invoice.buyer_tax_id = next((tax_id for _, tax_id in buyers if tax_id), "")
+    invoice.units = tuple(dict.fromkeys(unit for page in pages for unit in units_from_page(page)))
     invoice.original_names = '\n\n'.join('项目：' + name + ('\n规格：' + spec if spec else '') for name, spec in items)
     invoice.name = summarize_items(items)
     if invoice.name:
@@ -298,19 +446,10 @@ def read_invoice(path):
         return Invoice(path, error=str(exc) or type(exc).__name__)
 
 
-def scan_folder(folder, recursive=False, progress=None):
-    folder = Path(folder)
-    if not folder.is_dir():
-        raise ValueError("请选择存在的发票文件夹")
-    files = sorted((p for p in (folder.rglob("*") if recursive else folder.iterdir())
-                    if p.is_file() and p.suffix.lower() == ".pdf"), key=lambda p: str(p.relative_to(folder)).casefold())
-    if not files:
-        raise ValueError("文件夹中没有 PDF 文件")
+def deduplicate_invoices(read_invoices):
     invoices, seen, duplicates = [], {}, []
-    for i, path in enumerate(files, 1):
-        if progress:
-            progress(i, len(files), path.name)
-        invoice = read_invoice(path)
+    for invoice in read_invoices:
+        path = invoice.path
         if invoice.number and invoice.key in seen:
             previous = seen[invoice.key]
             if not invoice.error and not previous.error and invoice.total == previous.total and invoice.name == previous.name:
@@ -322,12 +461,73 @@ def scan_folder(folder, recursive=False, progress=None):
                     continue
                 duplicates.append((path, previous.path))
                 continue
-            invoice.error = "相同发票号码的内容不一致，请核对后移除重复项；" + invoice.error
+            if not invoice.error.startswith("相同发票号码的内容不一致"):
+                invoice.error = "相同发票号码的内容不一致，请核对后移除重复项；" + invoice.error
         elif invoice.number:
             seen[invoice.key] = invoice
         invoices.append(invoice)
+    return invoices, duplicates
+
+
+def scan_files(files, progress=None):
+    files = [Path(path) for path in files]
+    files = list(dict.fromkeys(path.resolve() for path in files
+                               if path.is_file() and path.suffix.lower() == ".pdf"))
+    if not files:
+        raise ValueError("没有可读取的 PDF 文件")
+    read_invoices = []
+    for i, path in enumerate(files, 1):
+        if progress:
+            progress(i, len(files), path.name)
+        read_invoices.append(read_invoice(path))
+    invoices, duplicates = deduplicate_invoices(read_invoices)
     prepare_names(invoices)
     return invoices, duplicates
+
+
+def scan_folder(folder, recursive=False, progress=None):
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise ValueError("请选择存在的发票文件夹")
+    files = sorted((p for p in (folder.rglob("*") if recursive else folder.iterdir())
+                    if p.is_file() and p.suffix.lower() == ".pdf"), key=lambda p: str(p.relative_to(folder)).casefold())
+    if not files:
+        raise ValueError("文件夹中没有 PDF 文件")
+    return scan_files(files, progress)
+
+
+def shorten_product_name(value):
+    """Limit the product-name body while preferring complete punctuation-delimited phrases."""
+    value = value.rstrip('. ')
+    if len(value) <= MAX_PRODUCT_NAME_LENGTH:
+        return value
+
+    punctuation_positions = [index for index, char in enumerate(value) if char in NAME_PUNCTUATION]
+    # If the next complete punctuation-delimited phrase would push the accumulated
+    # content past 50 characters, omit its leading punctuation and everything after it.
+    for first, second in zip(punctuation_positions, punctuation_positions[1:]):
+        if second > SOFT_SEGMENT_LIMIT:
+            prefix = value[:first].rstrip(NAME_PUNCTUATION + ' ')
+            if prefix and len(prefix) < MAX_PRODUCT_NAME_LENGTH:
+                return prefix + '等'
+            break
+
+    content_limit = MAX_PRODUCT_NAME_LENGTH - 1  # Reserve one character for “等”.
+    useful_breaks = [index for index in punctuation_positions if 30 <= index <= content_limit]
+    whitespace_breaks = [match.start() for match in re.finditer(r'\s+', value)
+                         if 30 <= match.start() <= content_limit]
+    cut = max(useful_breaks + whitespace_breaks, default=content_limit)
+
+    # Do not split a contiguous Latin model/serial token when a nearby boundary exists.
+    if (cut == content_limit and cut < len(value)
+            and re.fullmatch(r'[A-Za-z0-9._-]{2}', value[cut - 1:cut + 1])):
+        token_start = cut - 1
+        while token_start > 0 and re.match(r'[A-Za-z0-9._-]', value[token_start - 1]):
+            token_start -= 1
+        if token_start >= 30:
+            cut = token_start
+    prefix = value[:cut].rstrip(NAME_PUNCTUATION + ' ')
+    return (prefix or value[:content_limit]).rstrip('. ') + '等'
 
 
 def pdf_stem(name):
@@ -338,7 +538,7 @@ def pdf_stem(name):
     stem = re.sub(r'\s*[+＋]\s*', '和', stem)
     stem = re.sub(r'\s+', ' ', stem).translate(substitutions)
     stem = re.sub(r'[\x00-\x1f]', '', stem).strip().rstrip('. ')
-    stem = normalize_name(stem)[:MAX_FILENAME_STEM_LENGTH].rstrip('. ')
+    stem = shorten_product_name(normalize_name(stem))
     if not stem:
         raise ValueError("品名不能用作文件名")
     if re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", stem, re.I):
@@ -351,13 +551,147 @@ def matching_filename(invoice):
     actual = invoice.path.stem
     if actual.casefold() == stem.casefold():
         return True
-    match = re.search(r"（([2-9]\d*)）$", actual)
+    match = re.search(r"_([2-9]\d*)$", actual)
     return bool(match and actual.casefold() == collision_name(stem, int(match[1])).casefold())
 
 
 def collision_name(base, number):
-    suffix = f'（{number}）'
-    return base[:MAX_FILENAME_STEM_LENGTH-len(suffix)].rstrip('. ') + suffix
+    return f'{shorten_product_name(base)}_{number}'
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _same_file_content(source, target):
+    source, target = Path(source), Path(target)
+    return (source.stat().st_size == target.stat().st_size
+            and _file_sha256(source) == _file_sha256(target))
+
+
+def _problem_target(folder, source, reserved):
+    suffix = source.suffix or '.pdf'
+    stem = source.stem
+    candidate = source.name
+    number = 2
+    while candidate.casefold() in reserved or (folder / candidate).exists():
+        candidate = f'{stem}_{number}{suffix}'
+        number += 1
+    reserved.add(candidate.casefold())
+    return folder / candidate
+
+
+def send_to_recycle_bin(paths):
+    """Send existing paths to the Windows Recycle Bin without a permanent-delete fallback."""
+    sources = tuple(str(Path(path).resolve()) for path in paths)
+    if not sources:
+        return
+    if sys.platform != 'win32':
+        raise OSError('当前系统不支持 Windows 回收站')
+
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = (
+            ('hwnd', wintypes.HWND),
+            ('wFunc', wintypes.UINT),
+            ('pFrom', wintypes.LPCWSTR),
+            ('pTo', wintypes.LPCWSTR),
+            ('fFlags', ctypes.c_ushort),
+            ('fAnyOperationsAborted', wintypes.BOOL),
+            ('hNameMappings', ctypes.c_void_p),
+            ('lpszProgressTitle', wintypes.LPCWSTR),
+        )
+
+    source_list = '\0'.join(sources) + '\0\0'
+    operation = SHFILEOPSTRUCTW()
+    operation.wFunc = 3  # FO_DELETE
+    operation.pFrom = source_list
+    operation.fFlags = 0x0040 | 0x0010 | 0x0004 | 0x0400  # ALLOWUNDO, NOCONFIRMATION, SILENT, NOERRORUI
+    shell32 = ctypes.windll.shell32
+    shell32.SHFileOperationW.argtypes = (ctypes.POINTER(SHFILEOPSTRUCTW),)
+    shell32.SHFileOperationW.restype = ctypes.c_int
+    result = shell32.SHFileOperationW(ctypes.byref(operation))
+    if result or operation.fAnyOperationsAborted:
+        reason = f'Windows 回收站操作失败（错误代码 {result}）' if result else 'Windows 回收站操作已取消'
+        raise OSError(reason)
+
+
+def archive_problem_pdfs(sources, selected_folder, recycler=None, copier=shutil.copy2):
+    """Copy red invoices to a problem folder, verify them, then recycle the originals."""
+    selected_folder = Path(selected_folder).resolve()
+    if not selected_folder.is_dir():
+        raise FileNotFoundError(f'读取文件夹不存在：{selected_folder}')
+    problem_folder = selected_folder / PROBLEM_INVOICE_FOLDER
+    problem_folder.mkdir(exist_ok=True)
+    if not problem_folder.is_dir():
+        raise NotADirectoryError(f'无法创建问题发票文件夹：{problem_folder}')
+    problem_folder = problem_folder.resolve()
+
+    resolved_sources = tuple(Path(path).resolve() for path in sources)
+    if not resolved_sources:
+        return ProblemArchiveResult(problem_folder)
+    source_keys = [str(path).casefold() for path in resolved_sources]
+    if len(set(source_keys)) != len(source_keys):
+        return ProblemArchiveResult(problem_folder, failures=((resolved_sources[0], '同一原文件出现多次，未执行移动'),))
+
+    already_present, pending = [], []
+    reserved = {item.name.casefold() for item in problem_folder.iterdir()}
+    created = []
+    try:
+        for source in resolved_sources:
+            if not source.is_file():
+                raise FileNotFoundError(f'原文件不存在：{source}')
+            if source.parent == problem_folder:
+                already_present.append(source)
+                continue
+            target = _problem_target(problem_folder, source, reserved)
+            copier(source, target)
+            created.append(target)
+            pending.append((source, target))
+
+        if len({str(target).casefold() for _, target in pending}) != len(pending):
+            raise OSError('副本目标未能保持一一对应')
+        for source, target in pending:
+            if not target.is_file() or not _same_file_content(source, target):
+                raise OSError(f'副本校验失败：{source.name}')
+    except (OSError, ValueError) as exc:
+        cleanup_errors = []
+        for target in created:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                cleanup_errors.append(f'{target.name}: {cleanup_exc}')
+        detail = str(exc)
+        if cleanup_errors:
+            detail += '；未能清理副本：' + '；'.join(cleanup_errors)
+        failed = resolved_sources[0] if not pending else pending[-1][0]
+        return ProblemArchiveResult(problem_folder, already_present=tuple(already_present),
+                                    failures=((failed, detail),))
+
+    recycle_error = ''
+    try:
+        (recycler or send_to_recycle_bin)([source for source, _ in pending])
+    except OSError as exc:
+        recycle_error = str(exc)
+
+    moved, failures = [], []
+    for source, target in pending:
+        if not source.exists():
+            moved.append((source, target))
+            continue
+        detail = recycle_error or '原文件仍在原位置，未确认进入回收站'
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            detail += f'；未能清理副本：{cleanup_exc}'
+        failures.append((source, detail))
+    return ProblemArchiveResult(problem_folder, tuple(moved), tuple(already_present), tuple(failures))
 
 
 def prepare_names(invoices):
@@ -369,8 +703,8 @@ def prepare_names(invoices):
             continue
         base = pdf_stem(invoice.name)
         invoice.name = base
-        parent = invoice.path.parent.resolve()
-        origin = parent / invoice.path.name
+        parent = (invoice.destination_folder or invoice.path.parent).resolve()
+        origin = invoice.path.resolve()
         candidate = invoice.path.stem if matching_filename(invoice) else base
         number = 1
         while True:
@@ -385,36 +719,40 @@ def prepare_names(invoices):
 
 
 def rename_pdfs(invoices, duplicates=()):
-    """Rename selected originals to their already prepared names, without overwriting.
+    """Rename local PDFs or copy external PDFs into their destination folder.
 
-    Return updated duplicate references, successful renames and per-file failures.
+    Return updated duplicate references, successful operations and per-file failures.
     The application stages the workbook first and publishes it after all renames succeed.
     """
-    jobs = [(i.path, i.pdf_name or pdf_stem(i.name)) for i in invoices if not i.error]
-    updated, renamed, failures = {}, [], []
-    for source, name in jobs:
+    jobs = [(i.path, i.destination_folder, i.pdf_name or pdf_stem(i.name)) for i in invoices if not i.error]
+    updated, operations, failures = {}, [], []
+    for source, destination_folder, name in jobs:
         try:
-            # Both resolved parents stay in the source file's own directory.
-            parent = source.parent.resolve()
-            origin = parent / source.name
+            origin = source.resolve()
+            parent = (destination_folder or source.parent).resolve()
             if not origin.is_file():
                 raise FileNotFoundError("原文件不存在")
             if name != pdf_stem(name):
                 raise ValueError("请先确认规范化后的 PDF 文件名")
             target = parent / (name + '.pdf')
             if target.parent != parent:
-                raise ValueError("重命名目标必须位于原文件夹")
+                raise ValueError("PDF 目标路径无效")
             if origin == target:
                 updated[source] = source
                 continue
             if target.exists():
                 raise FileExistsError(f"目标文件已存在：{target.name}，请重新确认品名")
-            origin.rename(target)  # Windows refuses an existing destination.
+            if origin.parent == parent:
+                origin.rename(target)  # Windows refuses an existing destination.
+                action = "rename"
+            else:
+                shutil.copy2(origin, target)
+                action = "copy"
             updated[source] = target
-            renamed.append((source, target))
+            operations.append((source, target, action))
         except (OSError, ValueError) as exc:
             failures.append((source, str(exc)))
     for invoice in invoices:
         invoice.path = updated.get(invoice.path, invoice.path)
     duplicates = [(updated.get(duplicate, duplicate), updated.get(first, first)) for duplicate, first in duplicates]
-    return duplicates, renamed, failures
+    return duplicates, operations, failures

@@ -129,7 +129,7 @@ def export_workbook(template, output, invoices):
 
 
 def export_bundle(template, output, invoices, duplicates=()):
-    """Publish the workbook only when all corresponding PDF renames succeed."""
+    """Publish the workbook only when all PDF renames/copies succeed."""
     output = Path(output)
     if output.suffix.lower() != '.xlsx' or Path(template).resolve() == output.resolve():
         raise ValueError('请另存为新的 .xlsx 文件，不能覆盖模板')
@@ -138,21 +138,24 @@ def export_bundle(template, output, invoices, duplicates=()):
     fd, temp_name = tempfile.mkstemp(prefix='.报销清单_', suffix='.xlsx', dir=output.parent)
     os.close(fd)
     staged = Path(temp_name)
-    renamed = []
+    operations = []
     try:
         export_workbook(template, staged, invoices)
-        updated_duplicates, renamed, failures = rename_pdfs(invoices, duplicates)
+        updated_duplicates, operations, failures = rename_pdfs(invoices, duplicates)
         if failures:
             raise OSError('\n'.join(f'{path.name}：{reason}' for path, reason in failures))
         staged.replace(output)
-        return updated_duplicates, renamed
+        return updated_duplicates, operations
     except Exception as exc:
         rollback_errors = []
-        for source, target in reversed(renamed):
+        for source, target, action in reversed(operations):
             try:
-                if source.exists():
-                    raise FileExistsError(f'原路径已被占用：{source}')
-                target.rename(source)
+                if action == 'copy':
+                    target.unlink(missing_ok=True)
+                else:
+                    if source.exists():
+                        raise FileExistsError(f'原路径已被占用：{source}')
+                    target.rename(source)
             except OSError as rollback_error:
                 rollback_errors.append(str(rollback_error))
         for invoice, old_path in original_paths:
